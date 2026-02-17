@@ -1,6 +1,7 @@
 """Agent loop: the core processing engine."""
 
 import asyncio
+from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
 import json
 import json_repair
@@ -474,3 +475,98 @@ Respond with ONLY valid JSON, no markdown fences."""
         
         response = await self._process_message(msg, session_key=session_key)
         return response.content if response else ""
+
+    async def process_direct_stream(
+        self,
+        content: str,
+        session_key: str = "api:direct",
+        channel: str = "api",
+        chat_id: str = "direct",
+    ) -> AsyncIterator[str]:
+        """
+        Process a message with SSE-style streaming.
+
+        Yields JSON-encoded SSE event strings:
+          {"type": "tool_start", "name": "..."}
+          {"type": "tool_end", "name": "..."}
+          {"type": "token", "content": "..."}
+          {"type": "done", "content": "..."}
+        """
+        await self._connect_mcp()
+
+        session = self.sessions.get_or_create(session_key)
+        self._set_tool_context(channel, chat_id)
+
+        messages = self.context.build_messages(
+            history=session.get_history(max_messages=self.memory_window),
+            current_message=content,
+            channel=channel,
+            chat_id=chat_id,
+        )
+
+        iteration = 0
+        tools_used: list[str] = []
+        final_content = ""
+
+        while iteration < self.max_iterations:
+            iteration += 1
+
+            response = await self.provider.chat(
+                messages=messages,
+                tools=self.tools.get_definitions(),
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+
+            if response.has_tool_calls:
+                tool_call_dicts = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments),
+                        },
+                    }
+                    for tc in response.tool_calls
+                ]
+                messages = self.context.add_assistant_message(
+                    messages, response.content, tool_call_dicts,
+                    reasoning_content=response.reasoning_content,
+                )
+
+                for tool_call in response.tool_calls:
+                    tools_used.append(tool_call.name)
+                    yield json.dumps({"type": "tool_start", "name": tool_call.name})
+                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    messages = self.context.add_tool_result(
+                        messages, tool_call.id, tool_call.name, result,
+                    )
+                    yield json.dumps({"type": "tool_end", "name": tool_call.name})
+
+                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
+            else:
+                # Final round — stream token-by-token without tools
+                chunks: list[str] = []
+                async for delta in self.provider.chat_stream(
+                    messages=messages,
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                ):
+                    chunks.append(delta)
+                    yield json.dumps({"type": "token", "content": delta})
+                final_content = "".join(chunks)
+                break
+
+        if not final_content:
+            final_content = "I've completed processing but have no response to give."
+
+        # Save session
+        session.add_message("user", content)
+        session.add_message("assistant", final_content,
+                            tools_used=tools_used if tools_used else None)
+        self.sessions.save(session)
+
+        yield json.dumps({"type": "done", "content": final_content})

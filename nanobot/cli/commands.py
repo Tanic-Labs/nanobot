@@ -406,23 +406,32 @@ def gateway(
     
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
     
+    # API server (optional)
+    api_server = None
+    if config.api.enabled:
+        from nanobot.api.server import APIServer
+        api_server = APIServer(config=config, agent=agent, cron=cron)
+        console.print(f"[green]✓[/green] API server on port {config.api.port}")
+
     async def run():
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            tasks = [agent.run(), channels.start_all()]
+            if api_server:
+                tasks.append(api_server.start())
+            await asyncio.gather(*tasks)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
+            if api_server:
+                await api_server.stop()
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
             agent.stop()
             await channels.stop_all()
-    
+
     asyncio.run(run())
 
 
