@@ -60,6 +60,7 @@ include = [
     "nanobot/**/*.py",
     "nanobot/skills/**/*.md",
     "nanobot/skills/**/*.sh",
+    "nanobot/static/**/*.html",
 ]
 
 [tool.hatch.build.targets.sdist]

@@ -383,6 +383,15 @@ def channels_status():
         tg_config
     )
 
+    # Web UI
+    webui = config.channels.webui
+    webui_config = f"http://{webui.host}:{webui.port}" if webui.enabled else "[dim]not configured[/dim]"
+    table.add_row(
+        "WebUI",
+        "✓" if webui.enabled else "✗",
+        webui_config
+    )
+
     console.print(table)
 
 

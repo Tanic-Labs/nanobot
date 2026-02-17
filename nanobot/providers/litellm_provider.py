@@ -163,8 +163,14 @@ class LiteLLMProvider(LLMProvider):
                 "total_tokens": response.usage.total_tokens,
             }
         
+        # Strip <think>...</think> tags from reasoning models (e.g. MiniMax, DeepSeek)
+        content = message.content
+        if content:
+            import re
+            content = re.sub(r"(?:<think>)?[\s\S]*?</think>\s*", "", content).strip()
+
         return LLMResponse(
-            content=message.content,
+            content=content,
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason or "stop",
             usage=usage,

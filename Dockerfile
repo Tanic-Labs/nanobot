@@ -33,8 +33,8 @@ WORKDIR /app
 # Create config directory
 RUN mkdir -p /root/.nanobot
 
-# Gateway default port
-EXPOSE 18790
+# Gateway default port + WebUI port
+EXPOSE 18790 18791
 
 ENTRYPOINT ["nanobot"]
 CMD ["status"]
