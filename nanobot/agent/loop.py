@@ -569,4 +569,4 @@ Respond with ONLY valid JSON, no markdown fences."""
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
 
-        yield json.dumps({"type": "done", "content": final_content})
+        yield json.dumps({"type": "done", "content": final_content, "usage": response.usage if response else {}})

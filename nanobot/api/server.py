@@ -124,6 +124,28 @@ class APIServer:
         if "maxTokens" in body or "max_tokens" in body:
             defaults.max_tokens = int(body.get("maxTokens") or body.get("max_tokens"))
 
+        # Update channel configurations
+        if "channels" in body:
+            channels_data = body["channels"]
+            channels_cfg = self.config.channels
+            for ch_name, ch_update in channels_data.items():
+                if not isinstance(ch_update, dict):
+                    continue
+                ch_obj = getattr(channels_cfg, ch_name, None)
+                if ch_obj is None:
+                    continue
+                for key, value in ch_update.items():
+                    # Convert camelCase to snake_case for pydantic fields
+                    snake_key = key
+                    for attr in ("allow_from", "bridge_url", "bridge_token",
+                                 "app_id", "app_secret", "encrypt_key",
+                                 "verification_token"):
+                        if key == attr.replace("_", "") or key == attr:
+                            snake_key = attr
+                            break
+                    if hasattr(ch_obj, snake_key):
+                        setattr(ch_obj, snake_key, value)
+
         from nanobot.config.loader import save_config
         save_config(self.config)
         return web.json_response({"status": "ok"})
