@@ -25,16 +25,16 @@ COPY nanobot/ nanobot/
 COPY bridge/ bridge/
 RUN uv pip install --system --no-cache .
 
-# Build the WhatsApp bridge
+# Build the WhatsApp bridge (optional — skip gracefully if deps fail)
 WORKDIR /app/bridge
-RUN npm install && npm run build
+RUN npm install && npm run build || echo "Bridge build skipped (optional)"
 WORKDIR /app
 
 # Create config directory
 RUN mkdir -p /root/.nanobot
 
-# Gateway default port
-EXPOSE 18790
+# Gateway default port + API server + WebUI
+EXPOSE 18790 3015 18791
 
 ENTRYPOINT ["nanobot"]
 CMD ["status"]

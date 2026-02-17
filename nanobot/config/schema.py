@@ -162,6 +162,15 @@ class QQConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
 
 
+class WebUIConfig(Base):
+    """WebUI channel configuration."""
+
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 18791
+    allow_from: list[str] = Field(default_factory=list)
+
+
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
@@ -174,6 +183,7 @@ class ChannelsConfig(Base):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
+    webui: WebUIConfig = Field(default_factory=WebUIConfig)
 
 
 class AgentDefaults(Base):
@@ -265,6 +275,15 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class APIConfig(Base):
+    """HTTP REST API configuration."""
+
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 3015
+    token: str = ""  # Bearer auth; empty = no auth
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -273,6 +292,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    api: APIConfig = Field(default_factory=APIConfig)
 
     @property
     def workspace_path(self) -> Path:
