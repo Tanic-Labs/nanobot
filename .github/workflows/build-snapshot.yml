@@ -9,6 +9,18 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Verify secrets
+        run: |
+          if [ -z "${{ secrets.DO_API_TOKEN }}" ]; then
+            echo "::error::DO_API_TOKEN is empty! Check repo secrets."
+            exit 1
+          fi
+          echo "DO_API_TOKEN: ${#DO_TOKEN} chars"
+          echo "SUPABASE_URL set: $([ -n '${{ secrets.SUPABASE_URL }}' ] && echo yes || echo no)"
+          echo "All secrets verified."
+        env:
+          DO_TOKEN: ${{ secrets.DO_API_TOKEN }}
+
       - name: Checkout (for commit info)
         uses: actions/checkout@v4
 
