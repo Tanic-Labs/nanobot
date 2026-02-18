@@ -4,12 +4,14 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
 from dataclasses import asdict
 from typing import Any
 
 from aiohttp import web
 from loguru import logger
 
+from nanobot.agent.memory import MemoryStore
 from nanobot.config.schema import APIConfig, Config
 
 
@@ -191,6 +193,78 @@ class APIServer:
             return web.json_response({"status": "ok"})
         return web.json_response({"error": "not found"}, status=404)
 
+    async def _list_sessions(self, _request: web.Request) -> web.Response:
+        """List all conversation sessions."""
+        sessions = self.agent.sessions.list_sessions()
+        return web.json_response(sessions)
+
+    async def _list_tools(self, _request: web.Request) -> web.Response:
+        """List all registered tools."""
+        tools = []
+        for name, tool in self.agent.tools._tools.items():
+            tools.append({
+                "name": name,
+                "description": getattr(tool, "description", ""),
+            })
+        return web.json_response(tools)
+
+    async def _get_memory(self, _request: web.Request) -> web.Response:
+        """Read MEMORY.md content."""
+        memory = MemoryStore(self.agent.workspace)
+        content = memory.read_long_term()
+        return web.json_response({"content": content})
+
+    async def _patch_memory(self, request: web.Request) -> web.Response:
+        """Update MEMORY.md content."""
+        body = await request.json()
+        content = body.get("content")
+        if content is None:
+            return web.json_response({"error": "content is required"}, status=400)
+        memory = MemoryStore(self.agent.workspace)
+        memory.write_long_term(content)
+        return web.json_response({"status": "ok"})
+
+    async def _update(self, _request: web.Request) -> web.Response:
+        """Pull latest code from git and restart."""
+        logger.info("API: update requested")
+        repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["git", "pull", "--ff-only"],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            git_output = result.stdout.strip() or result.stderr.strip()
+            if result.returncode != 0:
+                return web.json_response({"error": "git pull failed", "output": git_output}, status=500)
+
+            pip_result = await asyncio.to_thread(
+                subprocess.run,
+                ["pip", "install", "-e", "."],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            pip_output = pip_result.stdout.strip() or pip_result.stderr.strip()
+
+            # Schedule restart after response is sent
+            async def _delayed_restart():
+                await asyncio.sleep(1)
+                os.kill(os.getpid(), signal.SIGTERM)
+            asyncio.get_event_loop().create_task(_delayed_restart())
+
+            return web.json_response({
+                "status": "updating",
+                "git": git_output,
+                "pip": "ok" if pip_result.returncode == 0 else pip_output,
+            })
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
     async def _restart(self, _request: web.Request) -> web.Response:
         """Send SIGTERM for container restart."""
         logger.info("API: restart requested")
@@ -211,6 +285,11 @@ class APIServer:
         app.router.add_get("/api/crons", self._list_crons)
         app.router.add_post("/api/crons", self._add_cron)
         app.router.add_delete("/api/crons/{id}", self._delete_cron)
+        app.router.add_get("/api/sessions", self._list_sessions)
+        app.router.add_get("/api/tools", self._list_tools)
+        app.router.add_get("/api/memory", self._get_memory)
+        app.router.add_patch("/api/memory", self._patch_memory)
+        app.router.add_post("/api/update", self._update)
         app.router.add_post("/api/restart", self._restart)
 
         self._runner = web.AppRunner(app)
