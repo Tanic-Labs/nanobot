@@ -50,11 +50,9 @@ jobs:
           echo "key_id=$KEY_ID" >> "$GITHUB_OUTPUT"
           echo "SSH key added (ID: $KEY_ID)"
 
-      - name: Create temp droplet (1GB + swap)
-        id: create
+      - name: Write cloud-init script
         run: |
-          VERSION=${{ steps.version.outputs.version }}
-          USER_DATA=$(cat <<'CLOUDEOF'
+          cat > /tmp/cloud-init.sh << 'INITEOF'
           #!/bin/bash
           set -euo pipefail
 
@@ -102,10 +100,15 @@ jobs:
           systemctl enable nanobot
 
           touch /tmp/nanobot-setup-done
-          CLOUDEOF
+          INITEOF
+          # Strip leading whitespace added by YAML indentation
+          sed -i 's/^          //' /tmp/cloud-init.sh
+          echo "Cloud-init script written ($(wc -l < /tmp/cloud-init.sh) lines)"
 
-          # Trim leading whitespace from heredoc
-          USER_DATA=$(echo "$USER_DATA" | sed 's/^          //')
+      - name: Create temp droplet (1GB + swap)
+        id: create
+        run: |
+          USER_DATA=$(cat /tmp/cloud-init.sh)
 
           RESPONSE=$(curl -sS -X POST "https://api.digitalocean.com/v2/droplets" \
             -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" \
