@@ -6,17 +6,15 @@ on:
 jobs:
   build-snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Verify secrets
         run: |
-          if [ -z "${{ secrets.DO_API_TOKEN }}" ]; then
-            echo "::error::DO_API_TOKEN is empty! Check repo secrets."
+          if [ -z "$DO_TOKEN" ]; then
+            echo "::error::DO_API_TOKEN is empty!"
             exit 1
           fi
-          echo "DO_API_TOKEN: ${#DO_TOKEN} chars"
-          echo "SUPABASE_URL set: $([ -n '${{ secrets.SUPABASE_URL }}' ] && echo yes || echo no)"
           echo "All secrets verified."
         env:
           DO_TOKEN: ${{ secrets.DO_API_TOKEN }}
@@ -36,43 +34,138 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION (commit: $COMMIT)"
 
-      - name: Create temp droplet
+      - name: Generate SSH key
+        id: ssh
+        run: |
+          ssh-keygen -t ed25519 -f /tmp/snapshot_key -N "" -q
+          PUB_KEY=$(cat /tmp/snapshot_key.pub)
+          echo "pub_key=$PUB_KEY" >> "$GITHUB_OUTPUT"
+
+          # Add key to DO account temporarily
+          RESPONSE=$(curl -sS -X POST "https://api.digitalocean.com/v2/account/keys" \
+            -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"snapshot-builder-$(date +%s)\", \"public_key\": \"$PUB_KEY\"}")
+          KEY_ID=$(echo "$RESPONSE" | jq -r '.ssh_key.id')
+          echo "key_id=$KEY_ID" >> "$GITHUB_OUTPUT"
+          echo "SSH key added (ID: $KEY_ID)"
+
+      - name: Create temp droplet (1GB + swap)
         id: create
         run: |
+          VERSION=${{ steps.version.outputs.version }}
+          USER_DATA=$(cat <<'CLOUDEOF'
+          #!/bin/bash
+          set -euo pipefail
+
+          # Create 2GB swap (critical for 1GB instance)
+          fallocate -l 2G /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+          apt-get update
+          apt-get install -y python3-pip python3-venv git ufw
+
+          python3 -m venv /opt/nanobot
+          /opt/nanobot/bin/pip install --upgrade pip
+
+          cd /opt && git clone https://github.com/Tanic-Labs/nanobot.git nanobot-src
+          /opt/nanobot/bin/pip install -e /opt/nanobot-src
+
+          mkdir -p /root/.nanobot/memory /root/.nanobot/workspace
+
+          cat > /etc/systemd/system/nanobot.service << 'SERVICEEOF'
+          [Unit]
+          Description=nanobot AI Agent
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/opt/nanobot/bin/nanobot gateway
+          WorkingDirectory=/root/.nanobot
+          Restart=always
+          RestartSec=5
+          Environment=HOME=/root
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICEEOF
+
+          ufw allow 22/tcp
+          ufw allow 3015/tcp
+          ufw allow 18791/tcp
+          ufw --force enable
+
+          systemctl daemon-reload
+          systemctl enable nanobot
+
+          touch /tmp/nanobot-setup-done
+          CLOUDEOF
+
+          # Trim leading whitespace from heredoc
+          USER_DATA=$(echo "$USER_DATA" | sed 's/^          //')
+
           RESPONSE=$(curl -sS -X POST "https://api.digitalocean.com/v2/droplets" \
             -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d '{
-              "name": "nanobot-snapshot-builder",
-              "region": "nyc1",
-              "size": "s-2vcpu-2gb",
-              "image": "ubuntu-24-04-x64",
-              "ssh_keys": [],
-              "user_data": "#!/bin/bash\nset -euo pipefail\napt-get update\napt-get install -y python3-pip python3-venv git ufw\npython3 -m venv /opt/nanobot\n/opt/nanobot/bin/pip install --upgrade pip\ncd /opt && git clone https://github.com/Tanic-Labs/nanobot.git nanobot-src\n/opt/nanobot/bin/pip install -e /opt/nanobot-src\nmkdir -p /root/.nanobot/memory /root/.nanobot/workspace\necho '${{ steps.version.outputs.version }}' > /opt/nanobot-src/.version\ncat > /etc/systemd/system/nanobot.service << SERVICEEOF\n[Unit]\nDescription=nanobot AI Agent\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/opt/nanobot/bin/nanobot gateway\nWorkingDirectory=/root/.nanobot\nRestart=always\nRestartSec=5\nEnvironment=HOME=/root\n\n[Install]\nWantedBy=multi-user.target\nSERVICEEOF\nufw allow 22/tcp\nufw allow 3015/tcp\nufw allow 18791/tcp\nufw --force enable\nsystemctl daemon-reload\nsystemctl enable nanobot\ntouch /tmp/nanobot-setup-done",
-              "tags": ["snapshot-builder"]
-            }')
+            -d "$(jq -n \
+              --arg name "nanobot-snapshot-builder" \
+              --arg region "nyc1" \
+              --arg size "s-1vcpu-1gb" \
+              --arg image "ubuntu-24-04-x64" \
+              --arg user_data "$USER_DATA" \
+              --argjson ssh_keys "[${{ steps.ssh.outputs.key_id }}]" \
+              '{name: $name, region: $region, size: $size, image: $image, user_data: $user_data, ssh_keys: $ssh_keys, tags: ["snapshot-builder"]}')")
+
           DROPLET_ID=$(echo "$RESPONSE" | jq -r '.droplet.id')
+          if [ "$DROPLET_ID" = "null" ] || [ -z "$DROPLET_ID" ]; then
+            echo "::error::Failed to create droplet: $RESPONSE"
+            exit 1
+          fi
           echo "droplet_id=$DROPLET_ID" >> "$GITHUB_OUTPUT"
           echo "Created droplet $DROPLET_ID"
 
       - name: Wait for droplet to be active
+        id: ip
         run: |
           DROPLET_ID=${{ steps.create.outputs.droplet_id }}
           for i in $(seq 1 60); do
-            STATUS=$(curl -sS "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
-              -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | jq -r '.droplet.status')
-            echo "Attempt $i: status=$STATUS"
-            if [ "$STATUS" = "active" ]; then break; fi
+            DATA=$(curl -sS "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
+              -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}")
+            STATUS=$(echo "$DATA" | jq -r '.droplet.status')
+            IP=$(echo "$DATA" | jq -r '.droplet.networks.v4[]? | select(.type=="public") | .ip_address')
+            echo "Attempt $i: status=$STATUS ip=$IP"
+            if [ "$STATUS" = "active" ] && [ -n "$IP" ] && [ "$IP" != "null" ]; then
+              echo "ip=$IP" >> "$GITHUB_OUTPUT"
+              break
+            fi
             sleep 10
           done
 
-      - name: Wait for cloud-init to finish
+      - name: Wait for cloud-init to complete
         run: |
-          # Wait up to 8 minutes for setup to complete
-          for i in $(seq 1 48); do
-            echo "Waiting for setup... attempt $i/48"
+          IP=${{ steps.ip.outputs.ip }}
+          echo "Polling $IP for setup completion..."
+          for i in $(seq 1 60); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/snapshot_key root@$IP "test -f /tmp/nanobot-setup-done" 2>/dev/null; then
+              echo "Setup complete! (attempt $i)"
+              # Verify nanobot is installed
+              ssh -i /tmp/snapshot_key root@$IP "/opt/nanobot/bin/nanobot --version" 2>/dev/null || true
+              exit 0
+            fi
+            echo "Attempt $i/60: setup still running..."
             sleep 10
           done
+          echo "::error::Cloud-init did not finish in time"
+          exit 1
+
+      - name: Write version file
+        run: |
+          IP=${{ steps.ip.outputs.ip }}
+          ssh -o StrictHostKeyChecking=no -i /tmp/snapshot_key root@$IP \
+            "echo '${{ steps.version.outputs.version }}' > /opt/nanobot-src/.version"
 
       - name: Power off droplet
         run: |
@@ -106,6 +199,10 @@ jobs:
               -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | jq -r '.action.status')
             echo "Attempt $i: status=$STATUS"
             if [ "$STATUS" = "completed" ]; then break; fi
+            if [ "$STATUS" = "errored" ]; then
+              echo "::error::Snapshot failed!"
+              exit 1
+            fi
             sleep 10
           done
           SNAPSHOT_ID=$(curl -sS "https://api.digitalocean.com/v2/droplets/$DROPLET_ID/snapshots" \
@@ -122,14 +219,12 @@ jobs:
           COMMIT=${{ steps.version.outputs.full_commit }}
           NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          # Update snapshot ID
           curl -sS -X PATCH "${{ secrets.SUPABASE_URL }}/rest/v1/platform_config?key=eq.nanobot_base_snapshot" \
             -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json" \
             -d "{\"value\": \"$SNAPSHOT_ID\", \"updated_at\": \"$NOW\"}"
 
-          # Upsert version
           curl -sS -X POST "${{ secrets.SUPABASE_URL }}/rest/v1/platform_config" \
             -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
@@ -137,7 +232,6 @@ jobs:
             -H "Prefer: resolution=merge-duplicates" \
             -d "{\"key\": \"nanobot_version\", \"value\": \"$VERSION\", \"updated_at\": \"$NOW\"}"
 
-          # Upsert commit
           curl -sS -X POST "${{ secrets.SUPABASE_URL }}/rest/v1/platform_config" \
             -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
@@ -147,14 +241,23 @@ jobs:
 
           echo "Updated: snapshot=$SNAPSHOT_ID, version=$VERSION, commit=$COMMIT"
 
-      - name: Destroy temp droplet
+      - name: Cleanup
         if: always()
         run: |
+          # Destroy temp droplet
           DROPLET_ID=${{ steps.create.outputs.droplet_id }}
           if [ -n "$DROPLET_ID" ] && [ "$DROPLET_ID" != "null" ]; then
             curl -sS -X DELETE "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
               -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}"
             echo "Destroyed temp droplet $DROPLET_ID"
+          fi
+
+          # Remove temp SSH key from DO account
+          KEY_ID=${{ steps.ssh.outputs.key_id }}
+          if [ -n "$KEY_ID" ] && [ "$KEY_ID" != "null" ]; then
+            curl -sS -X DELETE "https://api.digitalocean.com/v2/account/keys/$KEY_ID" \
+              -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}"
+            echo "Removed temp SSH key $KEY_ID"
           fi
 
       - name: Summary
@@ -163,6 +266,6 @@ jobs:
           echo "- **Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Commit:** ${{ steps.version.outputs.full_commit }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Snapshot ID:** ${{ steps.snapshot.outputs.snapshot_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Snapshot Name:** ${{ steps.snapshot.outputs.snapshot_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Instance:** s-1vcpu-1gb (with 2GB swap)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Supabase \`platform_config\` updated with snapshot ID, version, and commit." >> $GITHUB_STEP_SUMMARY
+          echo "Supabase \`platform_config\` updated." >> $GITHUB_STEP_SUMMARY
