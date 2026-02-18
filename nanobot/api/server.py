@@ -60,8 +60,25 @@ class APIServer:
     # Endpoints
     # ------------------------------------------------------------------
 
+    def _get_version(self) -> str:
+        """Read version from .version file or git."""
+        repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        version_file = os.path.join(repo_dir, ".version")
+        if os.path.exists(version_file):
+            return open(version_file).read().strip()
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=repo_dir, capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return "unknown"
+
     async def _health(self, _request: web.Request) -> web.Response:
-        return web.json_response({"status": "ok"})
+        return web.json_response({"status": "ok", "version": self._get_version()})
 
     async def _send(self, request: web.Request) -> web.Response:
         body = await request.json()

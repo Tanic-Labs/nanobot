@@ -1,8 +1,6 @@
 name: Build Nanobot Snapshot
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -11,6 +9,21 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Checkout (for commit info)
+        uses: actions/checkout@v4
+
+      - name: Get version info
+        id: version
+        run: |
+          COMMIT=$(git rev-parse --short HEAD)
+          FULL_COMMIT=$(git rev-parse HEAD)
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          VERSION="${TAG:-v0.0.0}-${COMMIT}"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "full_commit=$FULL_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION (commit: $COMMIT)"
+
       - name: Create temp droplet
         id: create
         run: |
@@ -23,7 +36,7 @@ jobs:
               "size": "s-2vcpu-2gb",
               "image": "ubuntu-24-04-x64",
               "ssh_keys": [],
-              "user_data": "#!/bin/bash\nset -euo pipefail\napt-get update\napt-get install -y python3-pip python3-venv git ufw\npython3 -m venv /opt/nanobot\n/opt/nanobot/bin/pip install --upgrade pip\ncd /opt && git clone https://github.com/Tanic-Labs/nanobot.git nanobot-src\n/opt/nanobot/bin/pip install -e /opt/nanobot-src\nmkdir -p /root/.nanobot/memory /root/.nanobot/workspace\ncat > /etc/systemd/system/nanobot.service << SERVICEEOF\n[Unit]\nDescription=nanobot AI Agent\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/opt/nanobot/bin/nanobot gateway\nWorkingDirectory=/root/.nanobot\nRestart=always\nRestartSec=5\nEnvironment=HOME=/root\n\n[Install]\nWantedBy=multi-user.target\nSERVICEEOF\nufw allow 22/tcp\nufw allow 3015/tcp\nufw allow 18791/tcp\nufw --force enable\nsystemctl daemon-reload\nsystemctl enable nanobot\ntouch /tmp/nanobot-setup-done",
+              "user_data": "#!/bin/bash\nset -euo pipefail\napt-get update\napt-get install -y python3-pip python3-venv git ufw\npython3 -m venv /opt/nanobot\n/opt/nanobot/bin/pip install --upgrade pip\ncd /opt && git clone https://github.com/Tanic-Labs/nanobot.git nanobot-src\n/opt/nanobot/bin/pip install -e /opt/nanobot-src\nmkdir -p /root/.nanobot/memory /root/.nanobot/workspace\necho '${{ steps.version.outputs.version }}' > /opt/nanobot-src/.version\ncat > /etc/systemd/system/nanobot.service << SERVICEEOF\n[Unit]\nDescription=nanobot AI Agent\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/opt/nanobot/bin/nanobot gateway\nWorkingDirectory=/root/.nanobot\nRestart=always\nRestartSec=5\nEnvironment=HOME=/root\n\n[Install]\nWantedBy=multi-user.target\nSERVICEEOF\nufw allow 22/tcp\nufw allow 3015/tcp\nufw allow 18791/tcp\nufw --force enable\nsystemctl daemon-reload\nsystemctl enable nanobot\ntouch /tmp/nanobot-setup-done",
               "tags": ["snapshot-builder"]
             }')
           DROPLET_ID=$(echo "$RESPONSE" | jq -r '.droplet.id')
@@ -37,25 +50,17 @@ jobs:
             STATUS=$(curl -sS "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
               -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | jq -r '.droplet.status')
             echo "Attempt $i: status=$STATUS"
-            if [ "$STATUS" = "active" ]; then
-              break
-            fi
+            if [ "$STATUS" = "active" ]; then break; fi
             sleep 10
           done
 
       - name: Wait for cloud-init to finish
         run: |
-          DROPLET_ID=${{ steps.create.outputs.droplet_id }}
-          IP=$(curl -sS "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
-            -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | \
-            jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
-          echo "Droplet IP: $IP"
           # Wait up to 8 minutes for setup to complete
           for i in $(seq 1 48); do
-            echo "Waiting for setup... attempt $i"
+            echo "Waiting for setup... attempt $i/48"
             sleep 10
           done
-          echo "Setup wait complete"
 
       - name: Power off droplet
         run: |
@@ -64,14 +69,11 @@ jobs:
             -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" \
             -H "Content-Type: application/json" \
             -d '{"type": "power_off"}'
-          # Wait for power off
           for i in $(seq 1 30); do
             STATUS=$(curl -sS "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
               -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | jq -r '.droplet.status')
             echo "Attempt $i: status=$STATUS"
-            if [ "$STATUS" = "off" ]; then
-              break
-            fi
+            if [ "$STATUS" = "off" ]; then break; fi
             sleep 5
           done
 
@@ -79,24 +81,21 @@ jobs:
         id: snapshot
         run: |
           DROPLET_ID=${{ steps.create.outputs.droplet_id }}
-          SNAP_NAME="nanobot-base-$(date +%Y%m%d-%H%M%S)"
+          VERSION=${{ steps.version.outputs.version }}
+          SNAP_NAME="nanobot-${VERSION}"
           RESPONSE=$(curl -sS -X POST "https://api.digitalocean.com/v2/droplets/$DROPLET_ID/actions" \
             -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" \
             -H "Content-Type: application/json" \
             -d "{\"type\": \"snapshot\", \"name\": \"$SNAP_NAME\"}")
           ACTION_ID=$(echo "$RESPONSE" | jq -r '.action.id')
           echo "Snapshot action $ACTION_ID started ($SNAP_NAME)"
-          # Wait for snapshot to complete
           for i in $(seq 1 60); do
             STATUS=$(curl -sS "https://api.digitalocean.com/v2/actions/$ACTION_ID" \
               -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | jq -r '.action.status')
             echo "Attempt $i: status=$STATUS"
-            if [ "$STATUS" = "completed" ]; then
-              break
-            fi
+            if [ "$STATUS" = "completed" ]; then break; fi
             sleep 10
           done
-          # Get snapshot ID
           SNAPSHOT_ID=$(curl -sS "https://api.digitalocean.com/v2/droplets/$DROPLET_ID/snapshots" \
             -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | \
             jq -r ".snapshots[] | select(.name==\"$SNAP_NAME\") | .id")
@@ -104,16 +103,37 @@ jobs:
           echo "snapshot_name=$SNAP_NAME" >> "$GITHUB_OUTPUT"
           echo "Created snapshot $SNAPSHOT_ID ($SNAP_NAME)"
 
-      - name: Update Supabase with new snapshot ID
+      - name: Update Supabase platform_config
         run: |
           SNAPSHOT_ID=${{ steps.snapshot.outputs.snapshot_id }}
+          VERSION=${{ steps.version.outputs.version }}
+          COMMIT=${{ steps.version.outputs.full_commit }}
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # Update snapshot ID
           curl -sS -X PATCH "${{ secrets.SUPABASE_URL }}/rest/v1/platform_config?key=eq.nanobot_base_snapshot" \
             -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json" \
-            -H "Prefer: return=representation" \
-            -d "{\"value\": \"$SNAPSHOT_ID\", \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
-          echo "Updated platform_config: nanobot_base_snapshot=$SNAPSHOT_ID"
+            -d "{\"value\": \"$SNAPSHOT_ID\", \"updated_at\": \"$NOW\"}"
+
+          # Upsert version
+          curl -sS -X POST "${{ secrets.SUPABASE_URL }}/rest/v1/platform_config" \
+            -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: resolution=merge-duplicates" \
+            -d "{\"key\": \"nanobot_version\", \"value\": \"$VERSION\", \"updated_at\": \"$NOW\"}"
+
+          # Upsert commit
+          curl -sS -X POST "${{ secrets.SUPABASE_URL }}/rest/v1/platform_config" \
+            -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: resolution=merge-duplicates" \
+            -d "{\"key\": \"nanobot_commit\", \"value\": \"$COMMIT\", \"updated_at\": \"$NOW\"}"
+
+          echo "Updated: snapshot=$SNAPSHOT_ID, version=$VERSION, commit=$COMMIT"
 
       - name: Destroy temp droplet
         if: always()
@@ -128,7 +148,9 @@ jobs:
       - name: Summary
         run: |
           echo "## Snapshot Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ steps.version.outputs.full_commit }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Snapshot ID:** ${{ steps.snapshot.outputs.snapshot_id }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Snapshot Name:** ${{ steps.snapshot.outputs.snapshot_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Supabase platform_config updated" >> $GITHUB_STEP_SUMMARY
-          echo "- Existing agents can be updated via \`POST api.termo.ai/agents/update-all\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Supabase \`platform_config\` updated with snapshot ID, version, and commit." >> $GITHUB_STEP_SUMMARY
