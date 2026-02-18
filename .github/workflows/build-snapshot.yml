@@ -1,0 +1,134 @@
+name: Build Nanobot Snapshot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Create temp droplet
+        id: create
+        run: |
+          RESPONSE=$(curl -sS -X POST "https://api.digitalocean.com/v2/droplets" \
+            -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "nanobot-snapshot-builder",
+              "region": "nyc1",
+              "size": "s-2vcpu-2gb",
+              "image": "ubuntu-24-04-x64",
+              "ssh_keys": [],
+              "user_data": "#!/bin/bash\nset -euo pipefail\napt-get update\napt-get install -y python3-pip python3-venv git ufw\npython3 -m venv /opt/nanobot\n/opt/nanobot/bin/pip install --upgrade pip\ncd /opt && git clone https://github.com/Tanic-Labs/nanobot.git nanobot-src\n/opt/nanobot/bin/pip install -e /opt/nanobot-src\nmkdir -p /root/.nanobot/memory /root/.nanobot/workspace\ncat > /etc/systemd/system/nanobot.service << SERVICEEOF\n[Unit]\nDescription=nanobot AI Agent\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/opt/nanobot/bin/nanobot gateway\nWorkingDirectory=/root/.nanobot\nRestart=always\nRestartSec=5\nEnvironment=HOME=/root\n\n[Install]\nWantedBy=multi-user.target\nSERVICEEOF\nufw allow 22/tcp\nufw allow 3015/tcp\nufw allow 18791/tcp\nufw --force enable\nsystemctl daemon-reload\nsystemctl enable nanobot\ntouch /tmp/nanobot-setup-done",
+              "tags": ["snapshot-builder"]
+            }')
+          DROPLET_ID=$(echo "$RESPONSE" | jq -r '.droplet.id')
+          echo "droplet_id=$DROPLET_ID" >> "$GITHUB_OUTPUT"
+          echo "Created droplet $DROPLET_ID"
+
+      - name: Wait for droplet to be active
+        run: |
+          DROPLET_ID=${{ steps.create.outputs.droplet_id }}
+          for i in $(seq 1 60); do
+            STATUS=$(curl -sS "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
+              -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | jq -r '.droplet.status')
+            echo "Attempt $i: status=$STATUS"
+            if [ "$STATUS" = "active" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+      - name: Wait for cloud-init to finish
+        run: |
+          DROPLET_ID=${{ steps.create.outputs.droplet_id }}
+          IP=$(curl -sS "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
+            -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | \
+            jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address')
+          echo "Droplet IP: $IP"
+          # Wait up to 8 minutes for setup to complete
+          for i in $(seq 1 48); do
+            echo "Waiting for setup... attempt $i"
+            sleep 10
+          done
+          echo "Setup wait complete"
+
+      - name: Power off droplet
+        run: |
+          DROPLET_ID=${{ steps.create.outputs.droplet_id }}
+          curl -sS -X POST "https://api.digitalocean.com/v2/droplets/$DROPLET_ID/actions" \
+            -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"type": "power_off"}'
+          # Wait for power off
+          for i in $(seq 1 30); do
+            STATUS=$(curl -sS "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
+              -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | jq -r '.droplet.status')
+            echo "Attempt $i: status=$STATUS"
+            if [ "$STATUS" = "off" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+      - name: Create snapshot
+        id: snapshot
+        run: |
+          DROPLET_ID=${{ steps.create.outputs.droplet_id }}
+          SNAP_NAME="nanobot-base-$(date +%Y%m%d-%H%M%S)"
+          RESPONSE=$(curl -sS -X POST "https://api.digitalocean.com/v2/droplets/$DROPLET_ID/actions" \
+            -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\": \"snapshot\", \"name\": \"$SNAP_NAME\"}")
+          ACTION_ID=$(echo "$RESPONSE" | jq -r '.action.id')
+          echo "Snapshot action $ACTION_ID started ($SNAP_NAME)"
+          # Wait for snapshot to complete
+          for i in $(seq 1 60); do
+            STATUS=$(curl -sS "https://api.digitalocean.com/v2/actions/$ACTION_ID" \
+              -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | jq -r '.action.status')
+            echo "Attempt $i: status=$STATUS"
+            if [ "$STATUS" = "completed" ]; then
+              break
+            fi
+            sleep 10
+          done
+          # Get snapshot ID
+          SNAPSHOT_ID=$(curl -sS "https://api.digitalocean.com/v2/droplets/$DROPLET_ID/snapshots" \
+            -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}" | \
+            jq -r ".snapshots[] | select(.name==\"$SNAP_NAME\") | .id")
+          echo "snapshot_id=$SNAPSHOT_ID" >> "$GITHUB_OUTPUT"
+          echo "snapshot_name=$SNAP_NAME" >> "$GITHUB_OUTPUT"
+          echo "Created snapshot $SNAPSHOT_ID ($SNAP_NAME)"
+
+      - name: Update Supabase with new snapshot ID
+        run: |
+          SNAPSHOT_ID=${{ steps.snapshot.outputs.snapshot_id }}
+          curl -sS -X PATCH "${{ secrets.SUPABASE_URL }}/rest/v1/platform_config?key=eq.nanobot_base_snapshot" \
+            -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=representation" \
+            -d "{\"value\": \"$SNAPSHOT_ID\", \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+          echo "Updated platform_config: nanobot_base_snapshot=$SNAPSHOT_ID"
+
+      - name: Destroy temp droplet
+        if: always()
+        run: |
+          DROPLET_ID=${{ steps.create.outputs.droplet_id }}
+          if [ -n "$DROPLET_ID" ] && [ "$DROPLET_ID" != "null" ]; then
+            curl -sS -X DELETE "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
+              -H "Authorization: Bearer ${{ secrets.DO_API_TOKEN }}"
+            echo "Destroyed temp droplet $DROPLET_ID"
+          fi
+
+      - name: Summary
+        run: |
+          echo "## Snapshot Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **Snapshot ID:** ${{ steps.snapshot.outputs.snapshot_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Snapshot Name:** ${{ steps.snapshot.outputs.snapshot_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Supabase platform_config updated" >> $GITHUB_STEP_SUMMARY
+          echo "- Existing agents can be updated via \`POST api.termo.ai/agents/update-all\`" >> $GITHUB_STEP_SUMMARY
